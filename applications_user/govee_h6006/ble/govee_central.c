@@ -206,6 +206,8 @@ static void keepalive_timer_callback(void* context) {
  * -------------------------------------------------------------------------- */
 
 GoveeCentral* govee_central_alloc(void) {
+    furi_hal_bt_central_init();
+
     GoveeCentral* gc = malloc(sizeof(GoveeCentral));
     furi_assert(gc);
     memset(gc, 0, sizeof(GoveeCentral));
@@ -227,16 +229,10 @@ void govee_central_free(GoveeCentral* gc) {
     govee_central_keepalive_stop(gc);
     furi_timer_free(gc->keepalive_timer);
 
-    if(gc->scanning) {
-        furi_hal_bt_central_stop_scan();
-        gc->scanning = false;
-    }
-
-    if(gc->conn) {
-        furi_hal_bt_central_disconnect(gc->conn);
-        /* conn pointer cleared in callback, but we won't receive it now */
-        gc->conn = NULL;
-    }
+    /* Deinit HAL first: unregisters dispatcher handler and nulls user
+     * callback/context, so no stale callback can fire against gc after
+     * we free it below. */
+    furi_hal_bt_central_deinit();
 
     furi_mutex_free(gc->mutex);
     free(gc);

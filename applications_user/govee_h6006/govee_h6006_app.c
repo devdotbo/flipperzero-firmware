@@ -2,6 +2,8 @@
 #include "scenes/scenes.h"
 #include "views/view_rgb_picker.h"
 #include <string.h>
+#include <bt/bt_service/bt.h>
+#include <furi_hal_bt.h>
 
 #define TAG "GoveeApp"
 
@@ -104,6 +106,13 @@ int32_t govee_h6006_app(void* p) {
     app->notifications = furi_record_open(RECORD_NOTIFICATION);
     app->storage = furi_record_open(RECORD_STORAGE);
     app->dialogs = furi_record_open(RECORD_DIALOGS);
+
+    // Suspend peripheral advertising so central scan isn't rejected (err 0xC)
+    Bt* bt = furi_record_open(RECORD_BT);
+    bt_disconnect(bt);
+    furi_delay_ms(200);
+    furi_hal_bt_stop_advertising();
+    furi_record_close(RECORD_BT);
 
     // View dispatcher + scene manager
     app->view_dispatcher = view_dispatcher_alloc();
@@ -209,6 +218,11 @@ int32_t govee_h6006_app(void* p) {
 
     scene_manager_free(app->scene_manager);
     view_dispatcher_free(app->view_dispatcher);
+
+    // Restore peripheral advertising for other Flipper BLE features
+    Bt* bt_teardown = furi_record_open(RECORD_BT);
+    bt_profile_restore_default(bt_teardown);
+    furi_record_close(RECORD_BT);
 
     furi_record_close(RECORD_DIALOGS);
     furi_record_close(RECORD_STORAGE);
