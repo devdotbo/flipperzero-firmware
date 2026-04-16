@@ -11,6 +11,7 @@ typedef enum {
     ControlItemRgb,
     ControlItemLightshow,
     ControlItemSaveFavorite,
+    ControlItemSyncAll,
     ControlItemDisconnect,
     ControlItemCount,
 } ControlItem;
@@ -162,6 +163,10 @@ void govee_scene_control_on_enter(void* ctx) {
     item = variable_item_list_add(vil, "Save Favorite", 1, NULL, app);
     variable_item_set_current_value_text(item, "");
 
+    // Sync current state to all saved bulbs (skips the connected one)
+    item = variable_item_list_add(vil, "Sync to All Saved", 1, NULL, app);
+    variable_item_set_current_value_text(item, ">");
+
     // Disconnect
     item = variable_item_list_add(vil, "Disconnect", 1, NULL, app);
     variable_item_set_current_value_text(item, "");
@@ -242,10 +247,17 @@ bool govee_scene_control_on_event(void* ctx, SceneManagerEvent event) {
                 popup_set_callback(app->popup, saved_popup_callback);
                 view_dispatcher_switch_to_view(app->view_dispatcher, GoveeViewPopup);
                 consumed = true;
+            } else if(item_idx == ControlItemSyncAll) {
+                // Stop keepalive while the group run holds the central link
+                govee_central_keepalive_stop(app->central);
+                if(app->keepalive_timer) furi_timer_stop(app->keepalive_timer);
+                scene_manager_next_scene(app->scene_manager, GoveeSceneGroupApply);
+                consumed = true;
             } else if(item_idx == ControlItemDisconnect) {
                 govee_central_keepalive_stop(app->central);
                 if(app->keepalive_timer) furi_timer_stop(app->keepalive_timer);
                 govee_central_disconnect(app->central);
+                app->has_current_addr = false;
                 return_to_prior_scene(app);
                 consumed = true;
             }

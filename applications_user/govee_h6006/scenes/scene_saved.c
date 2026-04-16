@@ -1,6 +1,8 @@
 #include "../govee_h6006_app.h"
 #include "scenes.h"
 
+#include <string.h>
+
 #define TAG "GoveeSceneSaved"
 
 #define SAVED_CONNECT_TIMEOUT_MS 5000
@@ -116,6 +118,9 @@ static void enter_state_connecting(GoveeH6006App* app, uint32_t idx) {
     view_dispatcher_switch_to_view(app->view_dispatcher, GoveeViewPopup);
 
     app->selected_bulb = -1; // cache-origin; no scan_results entry
+    memcpy(app->current_addr, e->addr, 6);
+    app->current_addr_type = e->addr_type;
+    app->has_current_addr = true;
     govee_central_connect(app->central, e->addr, e->addr_type);
 
     if(!saved_connect_timer) {

@@ -90,6 +90,13 @@ void govee_app_post_custom_event(GoveeH6006App* app, GoveeCustomEvent event) {
     view_dispatcher_send_custom_event(app->view_dispatcher, (uint32_t)event);
 }
 
+// Re-install the app's own central callback. Used by scenes that temporarily
+// hand the callback to another module (e.g. govee_group).
+void govee_app_restore_central_callback(GoveeH6006App* app) {
+    furi_assert(app);
+    govee_central_set_callback(app->central, on_central_event, app);
+}
+
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
@@ -156,6 +163,8 @@ int32_t govee_h6006_app(void* p) {
     app->cache = govee_bulb_cache_alloc();
     govee_bulb_cache_load(app->cache, GOVEE_APP_CACHE_PATH);
 
+    app->group = govee_group_alloc(app->central, app->cache);
+
     // Default state
     app->power_on = true;
     app->brightness = 100;
@@ -193,6 +202,7 @@ int32_t govee_h6006_app(void* p) {
         app->lightshow_timer = NULL;
     }
 
+    govee_group_free(app->group);
     govee_central_free(app->central);
 
     govee_bulb_cache_save(app->cache, GOVEE_APP_CACHE_PATH);

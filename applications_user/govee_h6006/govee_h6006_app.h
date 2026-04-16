@@ -18,6 +18,7 @@
 
 #include "protocol/govee_h6006.h"
 #include "ble/govee_central.h"
+#include "ble/govee_group.h"
 #include "storage/bulb_cache.h"
 
 #define GOVEE_APP_SCAN_MAX        16
@@ -32,6 +33,7 @@ typedef enum {
     GoveeSceneControl,
     GoveeSceneLightshow,
     GoveeSceneSaved,
+    GoveeSceneGroupApply,
     GoveeSceneCount,
 } GoveeScene;
 
@@ -54,6 +56,11 @@ typedef enum {
     GoveeCustomEventDiscoveryComplete,
     GoveeCustomEventWriteComplete,
     GoveeCustomEventError,
+    GoveeCustomEventGroupProgress,
+    GoveeCustomEventGroupBulbDone,
+    GoveeCustomEventGroupBulbFailed,
+    GoveeCustomEventGroupAllDone,
+    GoveeCustomEventGroupAborted,
 } GoveeCustomEvent;
 
 typedef struct {
@@ -78,11 +85,18 @@ typedef struct {
     DialogEx* dialog_ex;
 
     GoveeCentral* central;
+    GoveeGroup* group;
     GoveeBulbCache* cache;
 
     GoveeScanEntry scan_results[GOVEE_APP_SCAN_MAX];
     size_t scan_count;
     int selected_bulb;
+
+    // Current (or most recent) connected bulb — populated when a connect is
+    // initiated, consumed by Sync-to-All to skip + restore.
+    uint8_t current_addr[6];
+    uint8_t current_addr_type;
+    bool has_current_addr;
 
     bool power_on;
     uint8_t brightness;

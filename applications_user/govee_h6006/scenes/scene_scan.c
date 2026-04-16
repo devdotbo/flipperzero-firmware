@@ -1,6 +1,7 @@
 #include "../govee_h6006_app.h"
 #include "scenes.h"
 #include <furi_hal.h>
+#include <string.h>
 
 #define TAG "GoveeSceneScan"
 
@@ -121,6 +122,9 @@ bool govee_scene_scan_on_event(void* ctx, SceneManagerEvent event) {
 
                 // Initiate connection
                 const GoveeScanEntry* entry = &app->scan_results[idx];
+                memcpy(app->current_addr, entry->addr, 6);
+                app->current_addr_type = entry->addr_type;
+                app->has_current_addr = true;
                 govee_central_connect(app->central, entry->addr, entry->addr_type);
 
                 // Push control scene - it will wait for GoveeCustomEventConnected
