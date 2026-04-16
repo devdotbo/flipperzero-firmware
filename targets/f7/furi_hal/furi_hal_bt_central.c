@@ -112,7 +112,7 @@ void furi_hal_bt_central_init(void) {
     gap_central_init();
     gatt_client_init();
 
-    s_handler = ble_event_dispatcher_register_svc_handler(central_dispatcher_cb, NULL);
+    s_handler = ble_event_dispatcher_register_svc_handler(central_dispatcher_cb, &s_sentinel);
     furi_check(s_handler);
 
     s_initialized = true;

@@ -228,11 +228,14 @@ static bool gatt_client_disc_issue_next_desc_cmd(void) {
                 aci_gatt_disc_all_char_desc(gatt_client.conn_handle, start, end);
             furi_hal_bt_unlock_core2();
             if(status != BLE_STATUS_SUCCESS) {
-                FURI_LOG_E(
-                    TAG, "disc_all_char_desc failed for char %u: 0x%02X",
+                /* Best-effort: CCCD lookup is only needed for subscribe().
+                 * A failed descriptor query for a given characteristic must
+                 * not abort the whole discovery - skip this char and move on. */
+                FURI_LOG_W(
+                    TAG, "disc_all_char_desc skipped for char %u: 0x%02X",
                     gatt_client.disc_char_idx, status);
-                gatt_client_disc_fail(status);
-                return false;
+                gatt_client.disc_char_idx++;
+                continue;
             }
             return true;
         }
@@ -371,6 +374,16 @@ static void gatt_client_parse_char_records(
             gatt_client_promote_uuid16(uuid16, ch->uuid);
         }
         ch->cccd_handle = 0;
+        FURI_LOG_D(
+            TAG,
+            "char[%u] val=0x%04X props=0x%02X uuid_le=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+            gatt_client.num_chars - 1,
+            ch->value_handle,
+            ch->properties,
+            ch->uuid[0], ch->uuid[1], ch->uuid[2], ch->uuid[3],
+            ch->uuid[4], ch->uuid[5], ch->uuid[6], ch->uuid[7],
+            ch->uuid[8], ch->uuid[9], ch->uuid[10], ch->uuid[11],
+            ch->uuid[12], ch->uuid[13], ch->uuid[14], ch->uuid[15]);
         p += record_len;
     }
 }
@@ -554,6 +567,15 @@ uint16_t gatt_client_find_char(const uint8_t uuid128_human[16]) {
 
     uint8_t needle_wire[GATT_CLIENT_UUID128_LEN];
     gatt_client_reverse_uuid(uuid128_human, needle_wire);
+
+    FURI_LOG_D(
+        TAG,
+        "find_char needle_le=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x num=%u",
+        needle_wire[0], needle_wire[1], needle_wire[2], needle_wire[3],
+        needle_wire[4], needle_wire[5], needle_wire[6], needle_wire[7],
+        needle_wire[8], needle_wire[9], needle_wire[10], needle_wire[11],
+        needle_wire[12], needle_wire[13], needle_wire[14], needle_wire[15],
+        gatt_client.num_chars);
 
     for(uint8_t i = 0; i < gatt_client.num_chars; i++) {
         if(memcmp(gatt_client.chars[i].uuid, needle_wire, GATT_CLIENT_UUID128_LEN) == 0) {
