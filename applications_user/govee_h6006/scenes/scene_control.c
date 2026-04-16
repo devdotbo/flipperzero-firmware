@@ -16,10 +16,27 @@ typedef enum {
 } ControlItem;
 
 // Custom event sub-values (local to control scene)
-#define CTRL_EVENT_SAVED_POPUP_DONE 0x3001
-#define CTRL_EVENT_ENTER_ITEM       0x3100  // | (item_index & 0xFF)
+#define CTRL_EVENT_SAVED_POPUP_DONE      0x3001
+#define CTRL_EVENT_DISCONNECT_POPUP_DONE 0x3002
+#define CTRL_EVENT_ENTER_ITEM            0x3100 // | (item_index & 0xFF)
 
 static const char* power_text[2] = {"Off", "On"};
+
+// ---------------------------------------------------------------------------
+// Return helpers
+// ---------------------------------------------------------------------------
+
+static void return_to_prior_scene(GoveeH6006App* app) {
+    const uint32_t candidates[] = {GoveeSceneSaved, GoveeSceneScan, GoveeSceneWelcome};
+    for(size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if(scene_manager_search_and_switch_to_previous_scene(
+               app->scene_manager, candidates[i])) {
+            return;
+        }
+    }
+    scene_manager_stop(app->scene_manager);
+    view_dispatcher_stop(app->view_dispatcher);
+}
 
 // ---------------------------------------------------------------------------
 // Keepalive timer
@@ -77,6 +94,26 @@ static void saved_popup_callback(void* context) {
     view_dispatcher_send_custom_event(app->view_dispatcher, CTRL_EVENT_SAVED_POPUP_DONE);
 }
 
+static void disconnect_popup_callback(void* context) {
+    GoveeH6006App* app = context;
+    view_dispatcher_send_custom_event(app->view_dispatcher, CTRL_EVENT_DISCONNECT_POPUP_DONE);
+}
+
+// ---------------------------------------------------------------------------
+// Auto-cache on successful discovery
+// ---------------------------------------------------------------------------
+
+static void auto_cache_on_discovery(GoveeH6006App* app) {
+    if(app->selected_bulb < 0 || (size_t)app->selected_bulb >= app->scan_count) {
+        // Either cache-originated (already in cache) or no valid scan entry. Skip.
+        return;
+    }
+    const GoveeScanEntry* e = &app->scan_results[app->selected_bulb];
+    if(govee_bulb_cache_upsert(app->cache, e->name, e->addr, e->addr_type)) {
+        govee_bulb_cache_save(app->cache, GOVEE_APP_CACHE_PATH);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Scene handlers
 // ---------------------------------------------------------------------------
@@ -121,7 +158,7 @@ void govee_scene_control_on_enter(void* ctx) {
     item = variable_item_list_add(vil, "Lightshow", 1, NULL, app);
     variable_item_set_current_value_text(item, ">");
 
-    // Save to Favorites
+    // Save to Favorites (manual)
     item = variable_item_list_add(vil, "Save Favorite", 1, NULL, app);
     variable_item_set_current_value_text(item, "");
 
@@ -149,35 +186,43 @@ bool govee_scene_control_on_event(void* ctx, SceneManagerEvent event) {
     if(event.type == SceneManagerEventTypeCustom) {
         uint32_t ev = event.event;
 
-        if(ev == GoveeCustomEventDisconnected || ev == GoveeCustomEventError) {
+        if(ev == GoveeCustomEventDiscoveryComplete) {
+            auto_cache_on_discovery(app);
+            consumed = true;
+
+        } else if(ev == GoveeCustomEventDisconnected || ev == GoveeCustomEventError) {
             govee_central_keepalive_stop(app->central);
             if(app->keepalive_timer) furi_timer_stop(app->keepalive_timer);
 
             popup_reset(app->popup);
             popup_set_header(app->popup, "Disconnected", 64, 10, AlignCenter, AlignTop);
             popup_set_text(
-                app->popup, "Lost connection.\nReturning to scan.", 64, 32, AlignCenter, AlignCenter);
+                app->popup,
+                "Lost connection.\nReturning.",
+                64,
+                32,
+                AlignCenter,
+                AlignCenter);
             popup_set_timeout(app->popup, 2500);
             popup_enable_timeout(app->popup);
             popup_set_context(app->popup, app);
-            // After popup -> pop back to scan
-            popup_set_callback(app->popup, saved_popup_callback);
-            // We repurpose saved_popup_callback; it sends CTRL_EVENT_SAVED_POPUP_DONE
-            // but we distinguish via scene state - just pop scene below
+            popup_set_callback(app->popup, disconnect_popup_callback);
             view_dispatcher_switch_to_view(app->view_dispatcher, GoveeViewPopup);
             consumed = true;
 
+        } else if(ev == CTRL_EVENT_DISCONNECT_POPUP_DONE) {
+            return_to_prior_scene(app);
+            consumed = true;
+
         } else if(ev == CTRL_EVENT_SAVED_POPUP_DONE) {
-            // Return to scan scene
-            scene_manager_search_and_switch_to_previous_scene(
-                app->scene_manager, GoveeSceneScan);
+            // Return to control after transient "Saved!" popup
+            view_dispatcher_switch_to_view(app->view_dispatcher, GoveeViewVariableItemList);
             consumed = true;
 
         } else if((ev & 0xFF00) == (CTRL_EVENT_ENTER_ITEM & 0xFF00)) {
             uint32_t item_idx = ev & 0xFF;
 
             if(item_idx == ControlItemRgb) {
-                // Switch to RGB picker view
                 view_dispatcher_switch_to_view(app->view_dispatcher, GoveeViewRgbPicker);
                 consumed = true;
             } else if(item_idx == ControlItemLightshow) {
@@ -201,19 +246,12 @@ bool govee_scene_control_on_event(void* ctx, SceneManagerEvent event) {
                 govee_central_keepalive_stop(app->central);
                 if(app->keepalive_timer) furi_timer_stop(app->keepalive_timer);
                 govee_central_disconnect(app->central);
-                scene_manager_search_and_switch_to_previous_scene(
-                    app->scene_manager, GoveeSceneScan);
+                return_to_prior_scene(app);
                 consumed = true;
             }
-        } else if(ev == CTRL_EVENT_SAVED_POPUP_DONE) {
-            // Back to control after "Saved" popup
-            view_dispatcher_switch_to_view(app->view_dispatcher, GoveeViewVariableItemList);
-            consumed = true;
         }
 
     } else if(event.type == SceneManagerEventTypeBack) {
-        // Check if we're returning from the RGB picker view
-        // (handled as back from the view, not scene back)
         consumed = false;
     }
 
