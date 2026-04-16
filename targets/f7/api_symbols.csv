@@ -1,5 +1,5 @@
 entry,status,name,type,params
-Version,+,87.1,,
+Version,+,88.0,,
 Header,+,applications/drivers/subghz/cc1101_ext/cc1101_ext_interconnect.h,,
 Header,+,applications/services/bt/bt_service/bt.h,,
 Header,+,applications/services/bt/bt_service/bt_keys_storage.h,,
@@ -263,6 +263,7 @@ Header,+,lib/toolbox/varint.h,,
 Header,+,lib/toolbox/version.h,,
 Header,+,targets/f7/ble_glue/furi_ble/event_dispatcher.h,,
 Header,+,targets/f7/ble_glue/furi_ble/gatt.h,,
+Header,-,targets/f7/ble_glue/furi_ble/gatt_client.h,,
 Header,+,targets/f7/ble_glue/furi_ble/profile_interface.h,,
 Header,+,targets/f7/ble_glue/profiles/serial_profile.h,,
 Header,+,targets/f7/ble_glue/services/battery_service.h,,
@@ -297,6 +298,7 @@ Header,+,targets/f7/platform_specific/math_wrapper.h,,
 Header,+,targets/furi_hal_include/furi_hal.h,,
 Header,+,targets/furi_hal_include/furi_hal_adc.h,,
 Header,+,targets/furi_hal_include/furi_hal_bt.h,,
+Header,+,targets/furi_hal_include/furi_hal_bt_central.h,,
 Header,+,targets/furi_hal_include/furi_hal_cortex.h,,
 Header,+,targets/furi_hal_include/furi_hal_crypto.h,,
 Header,+,targets/furi_hal_include/furi_hal_debug.h,,
@@ -1304,6 +1306,17 @@ Function,+,furi_hal_adc_convert_vref,float,"FuriHalAdcHandle*, uint16_t"
 Function,+,furi_hal_adc_init,void,
 Function,+,furi_hal_adc_read,uint16_t,"FuriHalAdcHandle*, FuriHalAdcChannel"
 Function,+,furi_hal_adc_release,void,FuriHalAdcHandle*
+Function,+,furi_hal_bt_central_available,_Bool,
+Function,+,furi_hal_bt_central_connect,FuriHalBtCentralConnection*,"const uint8_t[( 6 )], uint8_t, FuriHalBtCentralEventCallback, void*"
+Function,+,furi_hal_bt_central_deinit,void,
+Function,+,furi_hal_bt_central_disconnect,void,FuriHalBtCentralConnection*
+Function,+,furi_hal_bt_central_find_char,uint16_t,"FuriHalBtCentralConnection*, const uint8_t[( 16 )]"
+Function,+,furi_hal_bt_central_gatt_discover,_Bool,FuriHalBtCentralConnection*
+Function,+,furi_hal_bt_central_gatt_subscribe,_Bool,"FuriHalBtCentralConnection*, uint16_t"
+Function,+,furi_hal_bt_central_gatt_write_nr,_Bool,"FuriHalBtCentralConnection*, uint16_t, const uint8_t*, size_t"
+Function,+,furi_hal_bt_central_init,void,
+Function,+,furi_hal_bt_central_start_scan,_Bool,"FuriHalBtCentralScanCallback, void*"
+Function,+,furi_hal_bt_central_stop_scan,_Bool,
 Function,+,furi_hal_bt_change_app,FuriHalBleProfileBase*,"const FuriHalBleProfileTemplate*, FuriHalBleProfileParams, const GapRootSecurityKeys*, GapEventCallback, void*"
 Function,+,furi_hal_bt_check_profile_type,_Bool,"FuriHalBleProfileBase*, const FuriHalBleProfileTemplate*"
 Function,+,furi_hal_bt_clear_white_list,_Bool,
@@ -1984,6 +1997,15 @@ Function,-,gap_init,_Bool,"GapConfig*, const GapRootSecurityKeys*, GapEventCallb
 Function,-,gap_start_advertising,void,
 Function,-,gap_stop_advertising,void,
 Function,-,gap_thread_stop,void,
+Function,-,gatt_client_attach,void,"uint16_t, FuriHalBtCentralEventCallback, void*"
+Function,-,gatt_client_deinit,void,
+Function,-,gatt_client_discover,_Bool,
+Function,-,gatt_client_find_char,uint16_t,const uint8_t[16]
+Function,-,gatt_client_handle_event,BleEventAckStatus,void*
+Function,-,gatt_client_init,void,
+Function,-,gatt_client_reset,void,
+Function,-,gatt_client_subscribe,_Bool,uint16_t
+Function,-,gatt_client_write_nr,_Bool,"uint16_t, const uint8_t*, size_t"
 Function,-,getc,int,FILE*
 Function,-,getc_unlocked,int,FILE*
 Function,-,getchar,int,
