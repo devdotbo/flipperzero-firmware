@@ -1,0 +1,24 @@
+App(
+    appid="govee_h6006",
+    name="Govee H6006",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="govee_h6006_app",
+    requires=[
+        "gui",
+        "bt",
+    ],
+    stack_size=4 * 1024,
+    fap_category="Bluetooth",
+    fap_description="BLE central control for Govee H6006 LED bulb",
+    fap_author="devdotbo",
+    fap_weburl="https://github.com/devdotbo/flipperzero-firmware",
+    fap_version="0.1",
+    sources=[
+        "govee_h6006_app.c",
+        "scenes/*.c",
+        "views/*.c",
+        "protocol/*.c",
+        "ble/*.c",
+        "storage/*.c",
+    ],
+)
