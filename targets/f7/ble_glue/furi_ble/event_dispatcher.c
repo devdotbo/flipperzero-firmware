@@ -33,7 +33,6 @@ BleEventFlowStatus ble_event_dispatcher_process_event(void* payload) {
         }
     }
 
-    /* Handlers for client-mode events are also to be implemented here. But not today. */
 
     /* Now, decide on a flow control action based on results of all handlers */
     switch(ack_status) {
