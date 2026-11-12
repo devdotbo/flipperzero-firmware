@@ -134,9 +134,13 @@ Each status request carries a request number; the tool accepts only the status f
 it, so a file written for an earlier request is never taken for the answer. The tool learns that
 the app echoes request numbers only from an answer to its own request, not from a status file
 that was already on the SD card. If no status file was on the card before the request, only a
-file that echoes a number the tool sent counts as such an answer. An older app build that does
-not echo them gets requests without a number, and the tool matches its answers by session and
-sequence number.
+file that echoes a number the tool sent counts as such an answer. If the app does not accept a
+request with a number before it has echoed one in this run (an older app build that does not
+echo them, or an app whose inbox is full), the tool sends requests without a number and matches
+the answers by session and sequence number, also answers that echo the number 0. It returns to
+request numbers once an answer shows that the app echoes them. While it sends requests without a
+number and no status file was on the card before the request, the answer to an earlier status
+request sent by hand that is still pending can be taken for the tool's own answer.
 
 ### Exit codes
 

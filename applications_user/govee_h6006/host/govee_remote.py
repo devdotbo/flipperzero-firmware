@@ -393,7 +393,11 @@ class App:
 
     def answers(self, st: Status, req: int, baseline: int | None, base_session: int | None, requests: int) -> bool:
         if "req" in st.kv:
-            # a file with a req= line (any value, also 0) is matched by id: only the dump
+            # in the arg-0 fallback the app's answers carry req=0: judged by session and
+            # sequence like a file without req=
+            if self.legacy_status and st.get_int("req", 0) == 0:
+                return self.new_by_sequence(st, baseline, base_session, requests)
+            # otherwise a file with a req= line (also 0) is matched by id: only the dump
             # that echoes this call's request id; the app handles the inbox in order, so it
             # was written after every signal sent before the request
             return st.get_int("req", 0) == req
@@ -405,7 +409,8 @@ class App:
         With an app that echoes the request id (req=), only the answer carrying this
         call's id is accepted, so a dump requested before the caller's command (an earlier
         raw 100, or an unanswered request left over from a restart) is never taken. A
-        file with a req= line is always matched by id, also with req=0. The tool learns
+        file with a req= line is matched by id, also with req=0, except in the arg-0
+        fallback, where a req=0 file is judged by session and sequence. The tool learns
         that the app echoes ids only from an answer to a request of this run (learn_echo),
         never from the file read before the request, which another app build may have left
         on the card; without such a baseline file, only an echo of an id sent in this run
@@ -1097,6 +1102,21 @@ def selftest(fixtures: str) -> int:
     except ToolError:
         ok = False
     check(ok, "no baseline, earlier manual req=0 answer first: the tool's own answer taken")
+
+    # No status file on the card before the request (no baseline), and the app refuses the
+    # first request (inbox full). The tool falls back to arg 0; the app answers with req=0.
+    # In the fallback a req=0 file is judged by session and sequence, so it is taken.
+    fake = FakeCli(sample, lambda d, b: rewrite(b, d, 1, {}, {"session": "77"}))
+    fake.absent_dumps = {0}
+    fake.reject_status = 1
+    app = App(fake, sleep=fake_sleep, clock=lambda: clock[0])
+    try:
+        st = app.dump(clock[0] + 10.0)
+        ok = st.seq == 1 and "req" in st.kv and st.get_int("req", -1) == 0
+    except ToolError:
+        ok = False
+    check(ok, "no baseline, first request refused: req=0 answer in the fallback taken, no timeout")
+    check(app.legacy_status and fake.status_args == [0], "no baseline, first request refused: one arg-0 request")
 
     # Request ids end to end: the dump after the command first shows the answer to the request of
     # the dump before it (pre-command state, rev 0, new session); it must not decide the result
