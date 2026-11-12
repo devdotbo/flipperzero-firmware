@@ -13,6 +13,57 @@
 - [User Documentation](https://docs.flipper.net/zero) - Learn more about your dolphin: specs, usage guides, and anything you want to ask.
 - [Developer Documentation](https://developer.flipper.net/flipperzero/doxygen) - Dive into the Flipper Zero Firmware source code: build system, firmware structure, and more.
 
+## About this fork
+
+This is an unofficial fork of official Flipper Zero firmware release 1.5.1. It adds a Bluetooth
+Low Energy central HAL (scan, one connection, characteristic discovery, write without response)
+and selects the BLE Full radio stack, which the central role needs. It also contains an external
+app that controls Govee H6006 bulbs with it.
+
+- [BLE central HAL](documentation/BleCentralHal.md): API for app authors.
+- [Govee H6006 app](applications_user/govee_h6006/README.md): requirements, flashing, use.
+- [Host tools of the app](applications_user/govee_h6006/host/README.md): tests and remote control.
+
+### Getting this fork
+
+The changes are on the branch `feat/ble-central-1.5.1` of
+<https://github.com/devdotbo/flipperzero-firmware>. The default branch of that repository does not
+contain them. Clone the branch with its submodules:
+
+```shell
+git clone --recursive --branch feat/ble-central-1.5.1 https://github.com/devdotbo/flipperzero-firmware.git
+```
+
+### Building and flashing this fork
+
+The sections "Cloning source code", "Building" and the two "Flashing firmware" sections further
+down are the official project's text. They clone the official repository and use the default
+build options, and plain `./fbt flash_usb` does not install the Full radio stack. For this fork
+use the steps in the [Govee H6006 app README](applications_user/govee_h6006/README.md#build-and-install):
+build with `COMPACT=1 DEBUG=0`, and on a device that still runs the Light radio stack install
+once with `./fbt COMPACT=1 DEBUG=0 flash_usb_full`, which also writes the Full stack.
+
+### Safety and going back
+
+Installing the Full stack rewrites the radio coprocessor. That is the risky step. During
+development of this fork, one full update that changed the radio stack left a device unable to
+start until its main firmware was written again with an SWD programmer. The update package is
+copied over USB, and the Flipper then installs it from the SD card by itself, restarting several
+times while it removes the old radio stack and writes the new one. Charge the battery first and
+keep the USB cable connected until the update has finished. The key combinations for reset and
+recovery are in [Key Combos](documentation/KeyCombo.md).
+
+The built-in apps of official 1.5.1 are unchanged, and external apps built for official 1.5.1 run
+on this fork, because its API table contains every entry of the official one. The firmware
+accepts both the Light and the Full radio stack when it starts the radio.
+
+To go back, install an official firmware release with qFlipper or the Flipper mobile app. The
+official update package puts the official main firmware and the Light stack back, so it writes
+the radio coprocessor again.
+
+The "Issues", "Discussions" and "Pull Request" links in the sections below lead to the official
+project, not to this fork. This fork has no issue tracker.
+
 # Contributing
 
 Our main goal is to build a healthy and sustainable community around Flipper, so we're open to any new ideas and contributions. We also have some rules and taboos here, so please read this page and our [Code of Conduct](/CODE_OF_CONDUCT.md) carefully.
