@@ -1,6 +1,0 @@
-ADD_SCENE(govee, welcome, Welcome)
-ADD_SCENE(govee, scan, Scan)
-ADD_SCENE(govee, control, Control)
-ADD_SCENE(govee, lightshow, Lightshow)
-ADD_SCENE(govee, saved, Saved)
-ADD_SCENE(govee, group_apply, GroupApply)

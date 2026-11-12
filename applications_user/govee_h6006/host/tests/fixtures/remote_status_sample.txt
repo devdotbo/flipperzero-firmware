@@ -1,0 +1,64 @@
+seq=7
+session=1592594996
+req=0
+uptime_ms=9940
+app=home
+inbox_overflow=0
+target=0
+scanning=0
+scan.refused=0
+lightshow=0
+registry.count=3
+registry.max=16
+registry.full=0
+registry.load=main
+registry.save=ok
+desired.rev=1
+desired.power=1
+desired.brightness=80
+desired.mode=white
+desired.kelvin=4000
+desired.rgb=000000
+engine.state=idle
+engine.fault=none
+engine.pass=1
+engine.in_pass=0
+engine.pending=0
+engine.targeted=3
+lamps=3
+lamp.1=rev=1 try=1 out=submitted targeted=1 conn_ms=300 disc_ms=200 write_ms=250 dis_ms=50 total_ms=950 writes=3 reused=0 type=0 addr=A4:C1:38:00:00:01 name=Kitchen
+lamp.2=rev=0 try=1 out=connect_timeout targeted=1 conn_ms=3000 disc_ms=0 write_ms=0 dis_ms=0 total_ms=3040 writes=0 reused=0 type=0 addr=A4:C1:38:00:00:02 name=Hall = lamp 2
+lamp.3=rev=1 try=1 out=submitted targeted=1 conn_ms=300 disc_ms=200 write_ms=250 dis_ms=50 total_ms=950 writes=3 reused=0 type=0 addr=A4:C1:38:00:00:03 name=Desk
+events=30
+events.total=30
+ev.1=5000 lamps lamp=- arg=3
+ev.2=5000 desired lamp=- arg=1
+ev.3=5000 pass_start lamp=- arg=1
+ev.4=5000 visit lamp=1 arg=1
+ev.5=5000 connect lamp=1 arg=1
+ev.6=5300 connected lamp=1 arg=300
+ev.7=5300 discover lamp=1 arg=1
+ev.8=5500 discovered lamp=1 arg=200
+ev.9=5500 write lamp=1 arg=0
+ev.10=5700 write lamp=1 arg=1
+ev.11=5750 write lamp=1 arg=2
+ev.12=5750 submitted lamp=1 arg=1
+ev.13=5900 disconnect lamp=1 arg=1
+ev.14=5950 disconnected lamp=1 arg=50
+ev.15=5950 visit lamp=2 arg=1
+ev.16=5950 connect lamp=2 arg=2
+ev.17=8950 connect_timeout lamp=2 arg=2
+ev.18=8990 cancel_done lamp=2 arg=40
+ev.19=8990 visit lamp=3 arg=1
+ev.20=8990 connect lamp=3 arg=3
+ev.21=9290 connected lamp=3 arg=300
+ev.22=9290 discover lamp=3 arg=3
+ev.23=9490 discovered lamp=3 arg=200
+ev.24=9490 write lamp=3 arg=0
+ev.25=9690 write lamp=3 arg=1
+ev.26=9740 write lamp=3 arg=2
+ev.27=9740 submitted lamp=3 arg=1
+ev.28=9890 disconnect lamp=3 arg=3
+ev.29=9940 disconnected lamp=3 arg=50
+ev.30=9940 pass_end lamp=- arg=4940
+end=7

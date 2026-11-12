@@ -12,13 +12,13 @@ App(
     fap_description="BLE central control for Govee H6006 LED bulb",
     fap_author="devdotbo",
     fap_weburl="https://github.com/devdotbo/flipperzero-firmware",
-    fap_version="0.1",
+    fap_version="0.2",
     sources=[
         "govee_h6006_app.c",
-        "scenes/*.c",
+        "govee_link.c",
+        "govee_files.c",
+        "govee_ui.c",
         "views/*.c",
-        "protocol/*.c",
-        "ble/*.c",
-        "storage/*.c",
+        "core/*.c",
     ],
 )

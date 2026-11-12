@@ -84,23 +84,16 @@ static bool rgb_picker_input_callback(InputEvent* event, void* context) {
             consumed = true;
             break;
         case InputKeyOk: {
-            GoveeH6006App* app = m->app;
+            // Set the desired colour; the engine sends it to the targeted lamps.
             const RgbColor* c = &rgb_palette[m->cursor];
-            app->rgb[0] = c->r;
-            app->rgb[1] = c->g;
-            app->rgb[2] = c->b;
-            govee_central_send_rgb(app->central, c->r, c->g, c->b);
+            govee_app_on_colour(m->app, m->cursor, c->r, c->g, c->b);
             consumed = true;
             break;
         }
         case InputKeyBack:
-            // Return to control view - switch back
-            {
-                GoveeH6006App* app = m->app;
-                view_dispatcher_switch_to_view(
-                    app->view_dispatcher, GoveeViewVariableItemList);
-                consumed = true;
-            }
+            // Return to Home
+            govee_app_on_colour_back(m->app);
+            consumed = true;
             break;
         default:
             break;
