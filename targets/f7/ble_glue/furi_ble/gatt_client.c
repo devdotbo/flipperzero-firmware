@@ -9,11 +9,20 @@
  *   - 128-bit UUIDs are stored raw (on-wire little-endian);
  *     16-bit UUIDs are promoted to 128-bit via the Bluetooth Base UUID.
  *   - only CCCD (0x2902) descriptors are tracked.
+ *
+ * Threads and locking: the state below is protected by gatt_client.mutex. It is
+ * taken by application threads (API calls), the BLE event thread (responses) and
+ * the central's deadline worker thread, held across single ACI commands, and
+ * never held while calling gap_central or the application. One GATT procedure
+ * runs at a time; each has a deadline. A procedure abandoned at its deadline
+ * leaves a procedure-complete to come; no new procedure starts before it is
+ * consumed, so it cannot be mistaken for the completion of a later one.
  */
 
 #include "gatt_client.h"
 
 #include "event_dispatcher.h"
+#include "../gap_central.h"
 
 #include "app_common.h"
 #include <ble/ble.h>
@@ -29,25 +38,33 @@
 #define GATT_CLIENT_MAX_SERVICES (16)
 #define GATT_CLIENT_MAX_CHARS    (32)
 
-#define GATT_CLIENT_UUID128_LEN  (16)
-#define GATT_CLIENT_UUID16_LEN   (2)
+#define GATT_CLIENT_UUID128_LEN (16)
+#define GATT_CLIENT_UUID16_LEN  (2)
 
 /* Attribute-data record sizes reported by the controller. */
 #define GATT_CLIENT_SVC_REC_128  (2 + 2 + 16) /* start + end + uuid128 */
-#define GATT_CLIENT_SVC_REC_16   (2 + 2 + 2)  /* start + end + uuid16  */
+#define GATT_CLIENT_SVC_REC_16   (2 + 2 + 2) /* start + end + uuid16  */
 #define GATT_CLIENT_CHAR_REC_128 (2 + 1 + 2 + 16) /* decl + props + value + uuid128 */
-#define GATT_CLIENT_CHAR_REC_16  (2 + 1 + 2 + 2)  /* decl + props + value + uuid16  */
+#define GATT_CLIENT_CHAR_REC_16  (2 + 1 + 2 + 2) /* decl + props + value + uuid16  */
+#define GATT_CLIENT_CHAR_DECL_128 (1 + 2 + 16) /* props + value + uuid128 */
 
 #define GATT_CLIENT_CCCD_UUID16 (0x2902)
 
-/* Discovery sub-state. */
+/* ATT payload limits: ATT_MTU - 3, and the STM32WB command limit
+ * (BLE_CMD_MAX_PARAM_LEN - 5) for write without response. */
+#define GATT_CLIENT_ATT_HEADER    (3U)
+#define GATT_CLIENT_WRITE_CMD_MAX (250U)
+#define GATT_CLIENT_ATT_ERR_ATTR_NOT_FOUND (0x0AU)
+#define GATT_CLIENT_STALE_MAX     (2U)
+
 typedef enum {
-    GattClientDiscIdle,
-    GattClientDiscServices,
-    GattClientDiscChars,
-    GattClientDiscDesc,
-    GattClientDiscComplete,
-} GattClientDiscState;
+    GattClientProcIdle,
+    GattClientProcServices,
+    GattClientProcChars,
+    GattClientProcDesc,
+    GattClientProcCharByUuid,
+    GattClientProcWriteDesc,
+} GattClientProc;
 
 typedef struct {
     uint16_t start_handle;
@@ -65,15 +82,21 @@ typedef struct {
 } GattClientChar;
 
 typedef struct {
-    /* User binding. */
-    uint16_t conn_handle;
-    FuriHalBtCentralEventCallback cb;
-    void* ctx;
+    FuriMutex* mutex;
 
-    /* Discovery state machine. */
-    GattClientDiscState disc_state;
-    uint8_t disc_service_idx; /* current service for char / desc iteration */
-    uint8_t disc_char_idx;    /* current char for desc iteration */
+    /* Link binding. */
+    bool attached;
+    uint16_t conn_handle;
+    uint32_t link_seq;
+    uint16_t att_mtu;
+
+    /* Running procedure. */
+    GattClientProc proc;
+    uint32_t deadline;
+    uint8_t stale_procs; /* abandoned procedures whose procedure-complete is still due */
+    uint8_t disc_service_idx; /* current service for char iteration */
+    uint8_t disc_char_idx; /* current char for desc iteration */
+    uint8_t target_uuid[GATT_CLIENT_UUID128_LEN]; /* discover-by-UUID target, wire order */
 
     /* Discovered topology. */
     uint8_t num_services;
@@ -82,23 +105,53 @@ typedef struct {
     GattClientChar chars[GATT_CLIENT_MAX_CHARS];
 
     bool initialized;
-    bool attached;
 } GattClient;
 
 static GattClient gatt_client;
 
+/* Event decided under the mutex, delivered after it. */
+typedef struct {
+    bool valid;
+    uint32_t link_seq;
+    FuriHalBtCentralEvent event;
+    uint16_t char_handle;
+    const uint8_t* data;
+    size_t len;
+} GattClientEmit;
+
 /* Bluetooth Base UUID, on-wire little-endian bytes.
  * Human form: 00000000-0000-1000-8000-00805F9B34FB
- * LE bytes:   FB 34 9B 5F 80 00 00 80 00 10 00 00 00 00 00 00
  * Bytes [12..13] are the 16-bit UUID little-endian (low, high).
  */
 static const uint8_t gatt_client_base_uuid_le[GATT_CLIENT_UUID128_LEN] = {
-    0xFB, 0x34, 0x9B, 0x5F, 0x80, 0x00, 0x00, 0x80,
-    0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    0xFB,
+    0x34,
+    0x9B,
+    0x5F,
+    0x80,
+    0x00,
+    0x00,
+    0x80,
+    0x00,
+    0x10,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00,
+    0x00};
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
 /* ------------------------------------------------------------------ */
+
+static inline void gatt_client_lock(void) {
+    furi_check(furi_mutex_acquire(gatt_client.mutex, FuriWaitForever) == FuriStatusOk);
+}
+
+static inline void gatt_client_unlock(void) {
+    furi_check(furi_mutex_release(gatt_client.mutex) == FuriStatusOk);
+}
 
 static void gatt_client_promote_uuid16(uint16_t uuid16, uint8_t out[GATT_CLIENT_UUID128_LEN]) {
     memcpy(out, gatt_client_base_uuid_le, GATT_CLIENT_UUID128_LEN);
@@ -106,31 +159,61 @@ static void gatt_client_promote_uuid16(uint16_t uuid16, uint8_t out[GATT_CLIENT_
     out[13] = (uint8_t)((uuid16 >> 8) & 0xFF);
 }
 
-static void
-    gatt_client_reverse_uuid(const uint8_t in[GATT_CLIENT_UUID128_LEN], uint8_t out[GATT_CLIENT_UUID128_LEN]) {
+static void gatt_client_reverse_uuid(
+    const uint8_t in[GATT_CLIENT_UUID128_LEN],
+    uint8_t out[GATT_CLIENT_UUID128_LEN]) {
     for(size_t i = 0; i < GATT_CLIENT_UUID128_LEN; i++) {
         out[i] = in[GATT_CLIENT_UUID128_LEN - 1 - i];
     }
 }
 
-static void gatt_client_emit(
+static inline uint16_t gatt_client_read_u16(const uint8_t* p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+/* Caller holds the mutex. */
+static void gatt_client_prepare(
+    GattClientEmit* e,
     FuriHalBtCentralEvent event,
     uint16_t char_handle,
     const uint8_t* data,
     size_t len) {
-    /* Snapshot callback under no lock: the state struct is only mutated
-     * on the BLE event worker thread (handle_event) and by the caller
-     * thread (attach/discover/...) which never races itself against
-     * emit paths the caller initiated synchronously.
-     */
-    FuriHalBtCentralEventCallback cb = gatt_client.cb;
-    void* ctx = gatt_client.ctx;
-    if(cb) {
-        cb(NULL, event, char_handle, data, len, ctx);
+    e->valid = true;
+    e->link_seq = gatt_client.link_seq;
+    e->event = event;
+    e->char_handle = char_handle;
+    e->data = data;
+    e->len = len;
+}
+
+/* Called WITHOUT the mutex. */
+static void gatt_client_deliver(const GattClientEmit* e) {
+    if(e->valid) {
+        gap_central_notify_user(e->link_seq, e->event, e->char_handle, e->data, e->len);
     }
 }
 
-/* Find characteristic slot index by value handle. Returns -1 on miss. */
+/* Caller holds the mutex. */
+static void gatt_client_start_proc(GattClientProc proc, uint32_t timeout_ms) {
+    gatt_client.proc = proc;
+    gatt_client.deadline = furi_get_tick() + furi_ms_to_ticks(timeout_ms);
+}
+
+/* Caller holds the mutex. A new procedure may start only when none runs and no
+ * abandoned one can still complete. */
+static bool gatt_client_can_start(const char* what) {
+    if(!gatt_client.attached) {
+        FURI_LOG_E(TAG, "%s: not attached", what);
+        return false;
+    }
+    if(gatt_client.proc != GattClientProcIdle || gatt_client.stale_procs > 0) {
+        FURI_LOG_E(
+            TAG, "%s: busy (proc=%u stale=%u)", what, gatt_client.proc, gatt_client.stale_procs);
+        return false;
+    }
+    return true;
+}
+
 static int gatt_client_char_idx_by_value_handle(uint16_t value_handle) {
     for(uint8_t i = 0; i < gatt_client.num_chars; i++) {
         if(gatt_client.chars[i].value_handle == value_handle) {
@@ -141,22 +224,17 @@ static int gatt_client_char_idx_by_value_handle(uint16_t value_handle) {
 }
 
 /* Compute the ATT range [start..end] over which to run descriptor
- * discovery for a given characteristic. The range must cover attributes
- * belonging to this characteristic only: from value_handle+1 up to either
+ * discovery for a given characteristic: from value_handle+1 up to either
  * the handle before the next characteristic in the same service, or the
  * service end handle if this is the last characteristic.
  */
-static bool gatt_client_char_desc_range(
-    uint8_t char_idx,
-    uint16_t* out_start,
-    uint16_t* out_end) {
+static bool gatt_client_char_desc_range(uint8_t char_idx, uint16_t* out_start, uint16_t* out_end) {
     const GattClientChar* ch = &gatt_client.chars[char_idx];
     const GattClientService* svc = &gatt_client.services[ch->service_idx];
 
     uint16_t start = ch->value_handle + 1;
     uint16_t end = svc->end_handle;
 
-    /* Look for the next char that belongs to the same service. */
     for(uint8_t i = 0; i < gatt_client.num_chars; i++) {
         if(i == char_idx) continue;
         const GattClientChar* other = &gatt_client.chars[i];
@@ -166,17 +244,13 @@ static bool gatt_client_char_desc_range(
         }
     }
 
-    if(start > end) {
+    if(start == 0 || start > end) {
         return false;
     }
     *out_start = start;
     *out_end = end;
     return true;
 }
-
-/* ------------------------------------------------------------------ */
-/* State machine drivers                                               */
-/* ------------------------------------------------------------------ */
 
 static void gatt_client_disc_reset_storage(void) {
     gatt_client.num_services = 0;
@@ -187,136 +261,118 @@ static void gatt_client_disc_reset_storage(void) {
     memset(gatt_client.chars, 0, sizeof(gatt_client.chars));
 }
 
-static void gatt_client_disc_fail(tBleStatus status) {
-    FURI_LOG_E(TAG, "Discovery failed: 0x%02X", status);
-    gatt_client.disc_state = GattClientDiscIdle;
-    gatt_client_emit(FuriHalBtCentralEventError, 0, NULL, 0);
+/* ------------------------------------------------------------------ */
+/* Procedure state machine (caller holds the mutex)                    */
+/* ------------------------------------------------------------------ */
+
+static void gatt_client_proc_fail(GattClientEmit* e, uint8_t status) {
+    FURI_LOG_E(TAG, "Procedure %u failed: 0x%02X", gatt_client.proc, status);
+    gatt_client.proc = GattClientProcIdle;
+    gatt_client_prepare(e, FuriHalBtCentralEventError, FURI_HAL_BT_CENTRAL_ERROR_GATT, NULL, 0);
 }
 
-/* Issue char-discovery for services[disc_service_idx]. */
-static bool gatt_client_disc_start_chars_for_current_service(void) {
-    if(gatt_client.disc_service_idx >= gatt_client.num_services) {
-        return false;
-    }
-    const GattClientService* svc = &gatt_client.services[gatt_client.disc_service_idx];
-    furi_hal_bt_lock_core2();
-    tBleStatus status = aci_gatt_disc_all_char_of_service(
-        gatt_client.conn_handle, svc->start_handle, svc->end_handle);
-    furi_hal_bt_unlock_core2();
-    if(status != BLE_STATUS_SUCCESS) {
-        FURI_LOG_E(
-            TAG, "disc_all_char_of_service failed for svc %u: 0x%02X",
-            gatt_client.disc_service_idx, status);
-        gatt_client_disc_fail(status);
-        return false;
-    }
-    return true;
-}
-
-/* Advance descriptor discovery: issue disc_all_char_desc for the next
- * characteristic that has a usable descriptor range. Skips characteristics
- * with empty ranges. Returns true if a command was queued, false if the
- * descriptor phase is complete (no more candidates).
- */
-static bool gatt_client_disc_issue_next_desc_cmd(void) {
-    while(gatt_client.disc_char_idx < gatt_client.num_chars) {
-        uint16_t start = 0;
-        uint16_t end = 0;
-        if(gatt_client_char_desc_range(gatt_client.disc_char_idx, &start, &end)) {
-            furi_hal_bt_lock_core2();
-            tBleStatus status =
-                aci_gatt_disc_all_char_desc(gatt_client.conn_handle, start, end);
-            furi_hal_bt_unlock_core2();
-            if(status != BLE_STATUS_SUCCESS) {
-                /* Best-effort: CCCD lookup is only needed for subscribe().
-                 * A failed descriptor query for a given characteristic must
-                 * not abort the whole discovery - skip this char and move on. */
-                FURI_LOG_W(
-                    TAG, "disc_all_char_desc skipped for char %u: 0x%02X",
-                    gatt_client.disc_char_idx, status);
-                gatt_client.disc_char_idx++;
-                continue;
-            }
-            return true;
-        }
-        /* Empty range: no descriptors possible for this characteristic. */
-        gatt_client.disc_char_idx++;
-    }
-    return false;
-}
-
-static void gatt_client_disc_finish(void) {
-    gatt_client.disc_state = GattClientDiscComplete;
+static void gatt_client_disc_finish(GattClientEmit* e) {
     FURI_LOG_I(
         TAG,
         "Discovery complete: %u services, %u characteristics",
         gatt_client.num_services,
         gatt_client.num_chars);
-    gatt_client.disc_state = GattClientDiscIdle;
-    gatt_client_emit(FuriHalBtCentralEventDiscoveryComplete, 0, NULL, 0);
+    gatt_client.proc = GattClientProcIdle;
+    gatt_client_prepare(e, FuriHalBtCentralEventDiscoveryComplete, 0, NULL, 0);
 }
 
-/* Called on ACI_GATT_PROC_COMPLETE_VSEVT_CODE. */
-static void gatt_client_on_proc_complete(uint8_t error_code) {
-    if(error_code != 0) {
-        gatt_client_disc_fail(error_code);
+/* Issue char-discovery for services[disc_service_idx]. */
+static bool gatt_client_disc_start_chars_for_current_service(GattClientEmit* e) {
+    const GattClientService* svc = &gatt_client.services[gatt_client.disc_service_idx];
+    tBleStatus status = aci_gatt_disc_all_char_of_service(
+        gatt_client.conn_handle, svc->start_handle, svc->end_handle);
+    if(status != BLE_STATUS_SUCCESS) {
+        gatt_client_proc_fail(e, status);
+        return false;
+    }
+    return true;
+}
+
+/* Issue disc_all_char_desc for the next characteristic with a usable range.
+ * Returns true if a command was queued, false if the descriptor phase is done. */
+static bool gatt_client_disc_issue_next_desc_cmd(void) {
+    while(gatt_client.disc_char_idx < gatt_client.num_chars) {
+        uint16_t start = 0;
+        uint16_t end = 0;
+        if(gatt_client_char_desc_range(gatt_client.disc_char_idx, &start, &end)) {
+            tBleStatus status = aci_gatt_disc_all_char_desc(gatt_client.conn_handle, start, end);
+            if(status == BLE_STATUS_SUCCESS) {
+                return true;
+            }
+            /* Best effort: CCCDs are only needed for subscribe(). */
+            FURI_LOG_W(
+                TAG,
+                "disc_all_char_desc skipped for char %u: 0x%02X",
+                gatt_client.disc_char_idx,
+                status);
+        }
+        gatt_client.disc_char_idx++;
+    }
+    return false;
+}
+
+/* ACI_GATT_PROC_COMPLETE for the running procedure. */
+static void gatt_client_on_proc_complete(GattClientEmit* e, uint8_t error_code) {
+    /* "Attribute not found" ends a discovery normally (nothing (more) found). */
+    if(error_code != 0 && error_code != GATT_CLIENT_ATT_ERR_ATTR_NOT_FOUND) {
+        gatt_client_proc_fail(e, error_code);
         return;
     }
 
-    switch(gatt_client.disc_state) {
-    case GattClientDiscServices:
-        FURI_LOG_I(
-            TAG, "Services discovered: %u", gatt_client.num_services);
+    switch(gatt_client.proc) {
+    case GattClientProcServices:
+        FURI_LOG_I(TAG, "Services discovered: %u", gatt_client.num_services);
         if(gatt_client.num_services == 0) {
-            /* Nothing more to do. */
-            gatt_client_disc_finish();
+            gatt_client_disc_finish(e);
             return;
         }
-        gatt_client.disc_state = GattClientDiscChars;
+        gatt_client.proc = GattClientProcChars;
         gatt_client.disc_service_idx = 0;
-        if(!gatt_client_disc_start_chars_for_current_service()) {
-            return; /* gatt_client_disc_fail() already emitted */
-        }
+        gatt_client_disc_start_chars_for_current_service(e);
         break;
 
-    case GattClientDiscChars:
+    case GattClientProcChars:
         gatt_client.disc_service_idx++;
         if(gatt_client.disc_service_idx < gatt_client.num_services) {
-            if(!gatt_client_disc_start_chars_for_current_service()) {
-                return;
-            }
+            gatt_client_disc_start_chars_for_current_service(e);
         } else {
             FURI_LOG_I(TAG, "Characteristics discovered: %u", gatt_client.num_chars);
-            if(gatt_client.num_chars == 0) {
-                gatt_client_disc_finish();
-                return;
-            }
-            gatt_client.disc_state = GattClientDiscDesc;
+            gatt_client.proc = GattClientProcDesc;
             gatt_client.disc_char_idx = 0;
             if(!gatt_client_disc_issue_next_desc_cmd()) {
-                /* No descriptor candidates at all -> done. */
-                gatt_client_disc_finish();
-                return;
+                gatt_client_disc_finish(e);
             }
         }
         break;
 
-    case GattClientDiscDesc:
+    case GattClientProcDesc:
         gatt_client.disc_char_idx++;
         if(!gatt_client_disc_issue_next_desc_cmd()) {
-            gatt_client_disc_finish();
-            return;
+            gatt_client_disc_finish(e);
         }
+        break;
+
+    case GattClientProcCharByUuid:
+        gatt_client_disc_finish(e);
+        break;
+
+    case GattClientProcWriteDesc:
+        FURI_LOG_I(TAG, "CCCD write complete");
+        gatt_client.proc = GattClientProcIdle;
         break;
 
     default:
-        /* Unexpected proc-complete; ignore. */
         break;
     }
 }
 
 /* ------------------------------------------------------------------ */
-/* Event payload parsers                                               */
+/* Event payload parsers (caller holds the mutex)                      */
 /* ------------------------------------------------------------------ */
 
 static void gatt_client_parse_service_records(
@@ -335,16 +391,38 @@ static void gatt_client_parse_service_records(
             return;
         }
         GattClientService* svc = &gatt_client.services[gatt_client.num_services++];
-        svc->start_handle = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-        svc->end_handle = (uint16_t)p[2] | ((uint16_t)p[3] << 8);
+        svc->start_handle = gatt_client_read_u16(&p[0]);
+        svc->end_handle = gatt_client_read_u16(&p[2]);
         if(record_len == GATT_CLIENT_SVC_REC_128) {
             memcpy(svc->uuid, p + 4, GATT_CLIENT_UUID128_LEN);
         } else {
-            uint16_t uuid16 = (uint16_t)p[4] | ((uint16_t)p[5] << 8);
-            gatt_client_promote_uuid16(uuid16, svc->uuid);
+            gatt_client_promote_uuid16(gatt_client_read_u16(&p[4]), svc->uuid);
         }
         p += record_len;
     }
+}
+
+static void gatt_client_add_char(
+    uint8_t service_idx,
+    uint16_t decl_handle,
+    uint8_t properties,
+    uint16_t value_handle,
+    const uint8_t uuid_wire[GATT_CLIENT_UUID128_LEN]) {
+    if(gatt_client_char_idx_by_value_handle(value_handle) >= 0) {
+        return; /* already known */
+    }
+    if(gatt_client.num_chars >= GATT_CLIENT_MAX_CHARS) {
+        FURI_LOG_W(TAG, "Char cap reached (%u), dropping rest", GATT_CLIENT_MAX_CHARS);
+        return;
+    }
+    GattClientChar* ch = &gatt_client.chars[gatt_client.num_chars++];
+    ch->service_idx = service_idx;
+    ch->char_handle = decl_handle;
+    ch->properties = properties;
+    ch->value_handle = value_handle;
+    memcpy(ch->uuid, uuid_wire, GATT_CLIENT_UUID128_LEN);
+    ch->cccd_handle = 0;
+    FURI_LOG_D(TAG, "char[%u] val=0x%04X props=0x%02X", gatt_client.num_chars - 1, value_handle, properties);
 }
 
 static void gatt_client_parse_char_records(
@@ -358,34 +436,36 @@ static void gatt_client_parse_char_records(
     const uint8_t* p = data;
     const uint8_t* end = data + total_len;
     while(p + record_len <= end) {
-        if(gatt_client.num_chars >= GATT_CLIENT_MAX_CHARS) {
-            FURI_LOG_W(TAG, "Char cap reached (%u), dropping rest", GATT_CLIENT_MAX_CHARS);
-            return;
-        }
-        GattClientChar* ch = &gatt_client.chars[gatt_client.num_chars++];
-        ch->service_idx = gatt_client.disc_service_idx;
-        ch->char_handle = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-        ch->properties = p[2];
-        ch->value_handle = (uint16_t)p[3] | ((uint16_t)p[4] << 8);
+        uint8_t uuid[GATT_CLIENT_UUID128_LEN];
         if(record_len == GATT_CLIENT_CHAR_REC_128) {
-            memcpy(ch->uuid, p + 5, GATT_CLIENT_UUID128_LEN);
+            memcpy(uuid, p + 5, GATT_CLIENT_UUID128_LEN);
         } else {
-            uint16_t uuid16 = (uint16_t)p[5] | ((uint16_t)p[6] << 8);
-            gatt_client_promote_uuid16(uuid16, ch->uuid);
+            gatt_client_promote_uuid16(gatt_client_read_u16(&p[5]), uuid);
         }
-        ch->cccd_handle = 0;
-        FURI_LOG_D(
-            TAG,
-            "char[%u] val=0x%04X props=0x%02X uuid_le=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
-            gatt_client.num_chars - 1,
-            ch->value_handle,
-            ch->properties,
-            ch->uuid[0], ch->uuid[1], ch->uuid[2], ch->uuid[3],
-            ch->uuid[4], ch->uuid[5], ch->uuid[6], ch->uuid[7],
-            ch->uuid[8], ch->uuid[9], ch->uuid[10], ch->uuid[11],
-            ch->uuid[12], ch->uuid[13], ch->uuid[14], ch->uuid[15]);
+        gatt_client_add_char(
+            gatt_client.disc_service_idx,
+            gatt_client_read_u16(&p[0]),
+            p[2],
+            gatt_client_read_u16(&p[3]),
+            uuid);
         p += record_len;
     }
+}
+
+/* One "Discover Characteristics By UUID" result: the characteristic declaration
+ * at Attribute_Handle, value = properties (1) + value handle (2) + UUID. */
+static void gatt_client_parse_char_by_uuid(const aci_gatt_disc_read_char_by_uuid_resp_event_rp0* ev) {
+    if(ev->Attribute_Value_Length != GATT_CLIENT_CHAR_DECL_128) {
+        FURI_LOG_W(TAG, "Unexpected char declaration len %u", ev->Attribute_Value_Length);
+        return;
+    }
+    const uint8_t* v = ev->Attribute_Value;
+    if(memcmp(&v[3], gatt_client.target_uuid, GATT_CLIENT_UUID128_LEN) != 0) {
+        return;
+    }
+    /* No service range is known for this char; index 0 is harmless because
+     * subscribe() needs the CCCD of a full discovery anyway. */
+    gatt_client_add_char(0, ev->Attribute_Handle, v[0], gatt_client_read_u16(&v[1]), &v[3]);
 }
 
 static void gatt_client_parse_desc_records(const aci_att_find_info_resp_event_rp0* ev) {
@@ -412,12 +492,9 @@ static void gatt_client_parse_desc_records(const aci_att_find_info_resp_event_rp
     const uint8_t* p = data;
     const uint8_t* end = data + total_len;
     while(p + pair_len <= end) {
-        uint16_t handle = (uint16_t)p[0] | ((uint16_t)p[1] << 8);
-        if(format == 0x01) {
-            uint16_t uuid16 = (uint16_t)p[2] | ((uint16_t)p[3] << 8);
-            if(uuid16 == GATT_CLIENT_CCCD_UUID16 && ch->cccd_handle == 0) {
-                ch->cccd_handle = handle;
-            }
+        if(format == 0x01 && gatt_client_read_u16(&p[2]) == GATT_CLIENT_CCCD_UUID16 &&
+           ch->cccd_handle == 0) {
+            ch->cccd_handle = gatt_client_read_u16(&p[0]);
         }
         /* 128-bit descriptors are not tracked (no CCCD is 128-bit). */
         p += pair_len;
@@ -429,8 +506,11 @@ static void gatt_client_parse_desc_records(const aci_att_find_info_resp_event_rp
 /* ------------------------------------------------------------------ */
 
 void gatt_client_init(void) {
+    furi_check(!gatt_client.initialized);
     memset(&gatt_client, 0, sizeof(gatt_client));
-    gatt_client.disc_state = GattClientDiscIdle;
+    gatt_client.mutex = furi_mutex_alloc(FuriMutexTypeNormal);
+    gatt_client.proc = GattClientProcIdle;
+    gatt_client.att_mtu = BLE_DEFAULT_ATT_MTU;
     gatt_client.initialized = true;
     FURI_LOG_I(TAG, "init");
 }
@@ -439,6 +519,7 @@ void gatt_client_deinit(void) {
     if(!gatt_client.initialized) {
         return;
     }
+    furi_mutex_free(gatt_client.mutex);
     memset(&gatt_client, 0, sizeof(gatt_client));
     FURI_LOG_I(TAG, "deinit");
 }
@@ -447,118 +528,143 @@ void gatt_client_reset(void) {
     if(!gatt_client.initialized) {
         return;
     }
-    FURI_LOG_I(TAG, "reset");
-    gatt_client.conn_handle = 0;
-    gatt_client.cb = NULL;
-    gatt_client.ctx = NULL;
+    gatt_client_lock();
     gatt_client.attached = false;
-    gatt_client.disc_state = GattClientDiscIdle;
+    gatt_client.conn_handle = 0;
+    gatt_client.proc = GattClientProcIdle;
+    gatt_client.stale_procs = 0;
+    gatt_client.att_mtu = BLE_DEFAULT_ATT_MTU;
     gatt_client_disc_reset_storage();
+    gatt_client_unlock();
+    FURI_LOG_I(TAG, "reset");
 }
 
-void gatt_client_attach(
-    uint16_t conn_handle,
-    FuriHalBtCentralEventCallback cb,
-    void* ctx) {
+void gatt_client_attach(uint16_t conn_handle, uint32_t link_seq) {
     furi_check(gatt_client.initialized);
+    gatt_client_lock();
     gatt_client.conn_handle = conn_handle;
-    gatt_client.cb = cb;
-    gatt_client.ctx = ctx;
-    gatt_client.attached = (cb != NULL);
-    gatt_client.disc_state = GattClientDiscIdle;
+    gatt_client.link_seq = link_seq;
+    gatt_client.attached = true;
+    gatt_client.proc = GattClientProcIdle;
+    gatt_client.stale_procs = 0;
+    gatt_client.att_mtu = BLE_DEFAULT_ATT_MTU;
     gatt_client_disc_reset_storage();
+    gatt_client_unlock();
     FURI_LOG_I(TAG, "attach conn_handle=0x%04X", conn_handle);
 }
 
 bool gatt_client_discover(void) {
     furi_check(gatt_client.initialized);
-    if(!gatt_client.attached) {
-        FURI_LOG_E(TAG, "discover: not attached");
-        return false;
+    bool ok = false;
+    gatt_client_lock();
+    if(gatt_client_can_start("discover")) {
+        tBleStatus status = aci_gatt_disc_all_primary_services(gatt_client.conn_handle);
+        if(status == BLE_STATUS_SUCCESS) {
+            /* Cleared only once the procedure runs, so a rejected call keeps the
+             * previous table. The mutex is still held: no response is parsed
+             * before this. */
+            gatt_client_disc_reset_storage();
+            gatt_client_start_proc(GattClientProcServices, GATT_CLIENT_DISCOVER_TIMEOUT_MS);
+            ok = true;
+        } else {
+            FURI_LOG_E(TAG, "disc_all_primary_services failed: 0x%02X", status);
+        }
     }
-    if(gatt_client.disc_state != GattClientDiscIdle) {
-        FURI_LOG_E(TAG, "discover: busy (state=%u)", gatt_client.disc_state);
-        return false;
-    }
+    gatt_client_unlock();
+    return ok;
+}
 
-    gatt_client_disc_reset_storage();
-    gatt_client.disc_state = GattClientDiscServices;
-
-    furi_hal_bt_lock_core2();
-    tBleStatus status = aci_gatt_disc_all_primary_services(gatt_client.conn_handle);
-    furi_hal_bt_unlock_core2();
-    if(status != BLE_STATUS_SUCCESS) {
-        FURI_LOG_E(TAG, "disc_all_primary_services failed: 0x%02X", status);
-        gatt_client.disc_state = GattClientDiscIdle;
-        return false;
+bool gatt_client_discover_char(const uint8_t uuid128_human[16]) {
+    furi_check(gatt_client.initialized);
+    furi_check(uuid128_human);
+    bool ok = false;
+    gatt_client_lock();
+    if(gatt_client_can_start("discover_char")) {
+        UUID_t uuid;
+        gatt_client_reverse_uuid(uuid128_human, uuid.UUID_128);
+        tBleStatus status = aci_gatt_disc_char_by_uuid(
+            gatt_client.conn_handle, 0x0001, 0xFFFF, UUID_TYPE_128, &uuid);
+        if(status == BLE_STATUS_SUCCESS) {
+            /* The table is cleared so the result always finds a slot (a full
+             * table would drop it and report the characteristic as absent).
+             * Entries of an earlier discovery, full or targeted, are forgotten:
+             * afterwards find_char() resolves only this UUID, and subscribe()
+             * needs a new full discovery. Cleared only once the procedure runs,
+             * so a rejected call keeps the previous table. The mutex is still
+             * held: no response is parsed before the reset and the target. */
+            gatt_client_disc_reset_storage();
+            memcpy(gatt_client.target_uuid, uuid.UUID_128, GATT_CLIENT_UUID128_LEN);
+            gatt_client_start_proc(GattClientProcCharByUuid, GATT_CLIENT_DISCOVER_CHAR_TIMEOUT_MS);
+            ok = true;
+        } else {
+            FURI_LOG_E(TAG, "disc_char_by_uuid failed: 0x%02X", status);
+        }
     }
-    FURI_LOG_I(TAG, "discover: services started");
-    return true;
+    gatt_client_unlock();
+    return ok;
 }
 
 bool gatt_client_write_nr(uint16_t char_value_handle, const uint8_t* data, size_t len) {
     furi_check(gatt_client.initialized);
-    if(!gatt_client.attached) {
-        FURI_LOG_E(TAG, "write_nr: not attached");
+    if(len > 0 && !data) {
         return false;
     }
-    if(len > UINT8_MAX) {
-        FURI_LOG_E(TAG, "write_nr: len %u exceeds ATT payload max", (unsigned)len);
-        return false;
-    }
-
-    furi_hal_bt_lock_core2();
-    tBleStatus status = aci_gatt_write_without_resp(
-        gatt_client.conn_handle, char_value_handle, (uint8_t)len, data);
-    furi_hal_bt_unlock_core2();
-
-    if(status != BLE_STATUS_SUCCESS) {
-        FURI_LOG_E(
-            TAG, "write_without_resp handle=0x%04X failed: 0x%02X", char_value_handle, status);
-        return false;
-    }
-
-    /* Fire-and-forget at ACI level: synthesize a WriteComplete on the
-     * caller's thread so the user layer has a uniform event stream.
-     */
-    gatt_client_emit(FuriHalBtCentralEventWriteComplete, char_value_handle, NULL, 0);
-    return true;
+    bool ok = false;
+    gatt_client_lock();
+    do {
+        if(!gatt_client.attached) {
+            FURI_LOG_E(TAG, "write_nr: not attached");
+            break;
+        }
+        size_t max_len = gatt_client.att_mtu - GATT_CLIENT_ATT_HEADER;
+        if(max_len > GATT_CLIENT_WRITE_CMD_MAX) max_len = GATT_CLIENT_WRITE_CMD_MAX;
+        if(len > max_len) {
+            FURI_LOG_E(TAG, "write_nr: len %u exceeds %u", (unsigned)len, (unsigned)max_len);
+            break;
+        }
+        tBleStatus status = aci_gatt_write_without_resp(
+            gatt_client.conn_handle, char_value_handle, (uint8_t)len, data);
+        if(status != BLE_STATUS_SUCCESS) {
+            FURI_LOG_E(
+                TAG, "write_without_resp handle=0x%04X failed: 0x%02X", char_value_handle, status);
+            break;
+        }
+        /* No completion event: write without response is not acknowledged. */
+        ok = true;
+    } while(false);
+    gatt_client_unlock();
+    return ok;
 }
 
 bool gatt_client_subscribe(uint16_t char_value_handle) {
     furi_check(gatt_client.initialized);
-    if(!gatt_client.attached) {
-        FURI_LOG_E(TAG, "subscribe: not attached");
-        return false;
-    }
-
-    int idx = gatt_client_char_idx_by_value_handle(char_value_handle);
-    if(idx < 0) {
-        FURI_LOG_E(TAG, "subscribe: unknown handle 0x%04X", char_value_handle);
-        return false;
-    }
-    uint16_t cccd_handle = gatt_client.chars[idx].cccd_handle;
-    if(cccd_handle == 0) {
-        FURI_LOG_E(TAG, "subscribe: no CCCD for handle 0x%04X", char_value_handle);
-        return false;
-    }
-
-    const uint8_t cccd_value[2] = {0x01, 0x00};
-    furi_hal_bt_lock_core2();
-    tBleStatus status = aci_gatt_write_char_desc(
-        gatt_client.conn_handle, cccd_handle, sizeof(cccd_value), cccd_value);
-    furi_hal_bt_unlock_core2();
-
-    if(status != BLE_STATUS_SUCCESS) {
-        FURI_LOG_E(
-            TAG,
-            "write_char_desc cccd=0x%04X failed: 0x%02X",
-            cccd_handle,
-            status);
-        return false;
-    }
-    FURI_LOG_I(TAG, "subscribe: handle=0x%04X cccd=0x%04X", char_value_handle, cccd_handle);
-    return true;
+    bool ok = false;
+    gatt_client_lock();
+    do {
+        if(!gatt_client_can_start("subscribe")) break;
+        int idx = gatt_client_char_idx_by_value_handle(char_value_handle);
+        if(idx < 0) {
+            FURI_LOG_E(TAG, "subscribe: unknown handle 0x%04X", char_value_handle);
+            break;
+        }
+        uint16_t cccd_handle = gatt_client.chars[idx].cccd_handle;
+        if(cccd_handle == 0) {
+            FURI_LOG_E(TAG, "subscribe: no CCCD for handle 0x%04X", char_value_handle);
+            break;
+        }
+        const uint8_t cccd_value[2] = {0x01, 0x00};
+        tBleStatus status = aci_gatt_write_char_desc(
+            gatt_client.conn_handle, cccd_handle, sizeof(cccd_value), cccd_value);
+        if(status != BLE_STATUS_SUCCESS) {
+            FURI_LOG_E(TAG, "write_char_desc cccd=0x%04X failed: 0x%02X", cccd_handle, status);
+            break;
+        }
+        gatt_client_start_proc(GattClientProcWriteDesc, GATT_CLIENT_WRITE_DESC_TIMEOUT_MS);
+        FURI_LOG_I(TAG, "subscribe: handle=0x%04X cccd=0x%04X", char_value_handle, cccd_handle);
+        ok = true;
+    } while(false);
+    gatt_client_unlock();
+    return ok;
 }
 
 uint16_t gatt_client_find_char(const uint8_t uuid128_human[16]) {
@@ -568,25 +674,36 @@ uint16_t gatt_client_find_char(const uint8_t uuid128_human[16]) {
     uint8_t needle_wire[GATT_CLIENT_UUID128_LEN];
     gatt_client_reverse_uuid(uuid128_human, needle_wire);
 
-    FURI_LOG_D(
-        TAG,
-        "find_char needle_le=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x num=%u",
-        needle_wire[0], needle_wire[1], needle_wire[2], needle_wire[3],
-        needle_wire[4], needle_wire[5], needle_wire[6], needle_wire[7],
-        needle_wire[8], needle_wire[9], needle_wire[10], needle_wire[11],
-        needle_wire[12], needle_wire[13], needle_wire[14], needle_wire[15],
-        gatt_client.num_chars);
-
+    uint16_t handle = 0;
+    gatt_client_lock();
     for(uint8_t i = 0; i < gatt_client.num_chars; i++) {
         if(memcmp(gatt_client.chars[i].uuid, needle_wire, GATT_CLIENT_UUID128_LEN) == 0) {
-            return gatt_client.chars[i].value_handle;
+            handle = gatt_client.chars[i].value_handle;
+            break;
         }
     }
-    return 0;
+    gatt_client_unlock();
+    return handle;
+}
+
+void gatt_client_tick(void) {
+    if(!gatt_client.initialized) {
+        return;
+    }
+    GattClientEmit emit = {0};
+    gatt_client_lock();
+    if(gatt_client.attached && gatt_client.proc != GattClientProcIdle &&
+       (int32_t)(furi_get_tick() - gatt_client.deadline) >= 0) {
+        FURI_LOG_E(TAG, "Procedure %u timed out", gatt_client.proc);
+        if(gatt_client.stale_procs < GATT_CLIENT_STALE_MAX) gatt_client.stale_procs++;
+        gatt_client_proc_fail(&emit, 0xFF);
+    }
+    gatt_client_unlock();
+    gatt_client_deliver(&emit);
 }
 
 /* ------------------------------------------------------------------ */
-/* Dispatcher entry                                                    */
+/* Dispatcher entry (BLE event thread)                                 */
 /* ------------------------------------------------------------------ */
 
 BleEventAckStatus gatt_client_handle_event(void* pckt) {
@@ -595,83 +712,127 @@ BleEventAckStatus gatt_client_handle_event(void* pckt) {
         return BleEventNotAck;
     }
 
-    hci_event_pckt* event_pckt = (hci_event_pckt*)((hci_uart_pckt*)pckt)->data;
+    hci_uart_pckt* uart_pckt = (hci_uart_pckt*)pckt;
+    if(uart_pckt->type != HCI_EVENT_PKT_TYPE) {
+        return BleEventNotAck;
+    }
+    hci_event_pckt* event_pckt = (hci_event_pckt*)uart_pckt->data;
     if(event_pckt->evt != HCI_VENDOR_SPECIFIC_DEBUG_EVT_CODE) {
         return BleEventNotAck;
     }
 
     evt_blecore_aci* blue_evt = (evt_blecore_aci*)event_pckt->data;
     switch(blue_evt->ecode) {
-    case ACI_ATT_READ_BY_GROUP_TYPE_RESP_VSEVT_CODE: {
-        if(gatt_client.disc_state != GattClientDiscServices) {
-            return BleEventNotAck;
-        }
-        aci_att_read_by_group_type_resp_event_rp0* ev =
-            (aci_att_read_by_group_type_resp_event_rp0*)blue_evt->data;
-        if(ev->Connection_Handle != gatt_client.conn_handle) {
-            return BleEventNotAck;
-        }
-        gatt_client_parse_service_records(
-            ev->Attribute_Data_List, ev->Data_Length, ev->Attribute_Data_Length);
-        return BleEventAckFlowEnable;
+    case ACI_ATT_READ_BY_GROUP_TYPE_RESP_VSEVT_CODE:
+    case ACI_ATT_READ_BY_TYPE_RESP_VSEVT_CODE:
+    case ACI_ATT_FIND_INFO_RESP_VSEVT_CODE:
+    case ACI_GATT_DISC_READ_CHAR_BY_UUID_RESP_VSEVT_CODE:
+    case ACI_ATT_EXCHANGE_MTU_RESP_VSEVT_CODE:
+    case ACI_GATT_PROC_COMPLETE_VSEVT_CODE:
+    case ACI_GATT_PROC_TIMEOUT_VSEVT_CODE:
+    case ACI_GATT_ERROR_RESP_VSEVT_CODE:
+    case ACI_GATT_NOTIFICATION_VSEVT_CODE:
+        break;
+    default:
+        return BleEventNotAck;
     }
 
-    case ACI_ATT_READ_BY_TYPE_RESP_VSEVT_CODE: {
-        if(gatt_client.disc_state != GattClientDiscChars) {
-            return BleEventNotAck;
-        }
-        aci_att_read_by_type_resp_event_rp0* ev =
-            (aci_att_read_by_type_resp_event_rp0*)blue_evt->data;
-        if(ev->Connection_Handle != gatt_client.conn_handle) {
-            return BleEventNotAck;
-        }
-        gatt_client_parse_char_records(
-            ev->Handle_Value_Pair_Data, ev->Data_Length, ev->Handle_Value_Pair_Length);
-        return BleEventAckFlowEnable;
+    /* All events above start with the 16-bit Connection_Handle. */
+    const uint16_t handle = gatt_client_read_u16(blue_evt->data);
+    GattClientEmit emit = {0};
+
+    gatt_client_lock();
+    if(!gatt_client.attached || handle != gatt_client.conn_handle) {
+        gatt_client_unlock();
+        return BleEventNotAck;
     }
 
-    case ACI_ATT_FIND_INFO_RESP_VSEVT_CODE: {
-        if(gatt_client.disc_state != GattClientDiscDesc) {
-            return BleEventNotAck;
+    switch(blue_evt->ecode) {
+    case ACI_ATT_READ_BY_GROUP_TYPE_RESP_VSEVT_CODE:
+        if(gatt_client.proc == GattClientProcServices) {
+            aci_att_read_by_group_type_resp_event_rp0* ev =
+                (aci_att_read_by_group_type_resp_event_rp0*)blue_evt->data;
+            gatt_client_parse_service_records(
+                ev->Attribute_Data_List, ev->Data_Length, ev->Attribute_Data_Length);
         }
-        aci_att_find_info_resp_event_rp0* ev =
-            (aci_att_find_info_resp_event_rp0*)blue_evt->data;
-        if(ev->Connection_Handle != gatt_client.conn_handle) {
-            return BleEventNotAck;
+        break;
+
+    case ACI_ATT_READ_BY_TYPE_RESP_VSEVT_CODE:
+        if(gatt_client.proc == GattClientProcChars) {
+            aci_att_read_by_type_resp_event_rp0* ev =
+                (aci_att_read_by_type_resp_event_rp0*)blue_evt->data;
+            gatt_client_parse_char_records(
+                ev->Handle_Value_Pair_Data, ev->Data_Length, ev->Handle_Value_Pair_Length);
         }
-        gatt_client_parse_desc_records(ev);
-        return BleEventAckFlowEnable;
+        break;
+
+    case ACI_ATT_FIND_INFO_RESP_VSEVT_CODE:
+        if(gatt_client.proc == GattClientProcDesc) {
+            gatt_client_parse_desc_records((aci_att_find_info_resp_event_rp0*)blue_evt->data);
+        }
+        break;
+
+    case ACI_GATT_DISC_READ_CHAR_BY_UUID_RESP_VSEVT_CODE:
+        if(gatt_client.proc == GattClientProcCharByUuid) {
+            gatt_client_parse_char_by_uuid(
+                (aci_gatt_disc_read_char_by_uuid_resp_event_rp0*)blue_evt->data);
+        }
+        break;
+
+    case ACI_ATT_EXCHANGE_MTU_RESP_VSEVT_CODE: {
+        aci_att_exchange_mtu_resp_event_rp0* ev =
+            (aci_att_exchange_mtu_resp_event_rp0*)blue_evt->data;
+        uint16_t mtu = ev->Server_RX_MTU;
+        if(mtu > CFG_BLE_MAX_ATT_MTU) mtu = CFG_BLE_MAX_ATT_MTU;
+        if(mtu < BLE_DEFAULT_ATT_MTU) mtu = BLE_DEFAULT_ATT_MTU;
+        gatt_client.att_mtu = mtu;
+        FURI_LOG_I(TAG, "ATT_MTU %u", mtu);
+        break;
     }
 
     case ACI_GATT_PROC_COMPLETE_VSEVT_CODE: {
-        aci_gatt_proc_complete_event_rp0* ev =
-            (aci_gatt_proc_complete_event_rp0*)blue_evt->data;
-        if(ev->Connection_Handle != gatt_client.conn_handle) {
-            return BleEventNotAck;
+        aci_gatt_proc_complete_event_rp0* ev = (aci_gatt_proc_complete_event_rp0*)blue_evt->data;
+        if(gatt_client.stale_procs > 0) {
+            /* Completion of a procedure abandoned at its deadline. */
+            gatt_client.stale_procs--;
+            FURI_LOG_I(TAG, "Late procedure-complete consumed");
+        } else if(gatt_client.proc != GattClientProcIdle) {
+            gatt_client_on_proc_complete(&emit, ev->Error_Code);
         }
-        if(gatt_client.disc_state == GattClientDiscIdle) {
-            /* Not our procedure; let other handlers see it. */
-            return BleEventNotAck;
+        break;
+    }
+
+    case ACI_GATT_PROC_TIMEOUT_VSEVT_CODE:
+        /* ATT transaction timeout: no further procedure completes on this link. */
+        if(gatt_client.proc != GattClientProcIdle) {
+            gatt_client_proc_fail(&emit, 0xFE);
         }
-        gatt_client_on_proc_complete(ev->Error_Code);
-        return BleEventAckFlowEnable;
+        break;
+
+    case ACI_GATT_ERROR_RESP_VSEVT_CODE: {
+        aci_gatt_error_resp_event_rp0* ev = (aci_gatt_error_resp_event_rp0*)blue_evt->data;
+        FURI_LOG_D(
+            TAG, "ATT error opcode=0x%02X attr=0x%04X err=0x%02X", ev->Req_Opcode,
+            ev->Attribute_Handle, ev->Error_Code);
+        break;
     }
 
     case ACI_GATT_NOTIFICATION_VSEVT_CODE: {
-        aci_gatt_notification_event_rp0* ev =
-            (aci_gatt_notification_event_rp0*)blue_evt->data;
-        if(ev->Connection_Handle != gatt_client.conn_handle) {
-            return BleEventNotAck;
-        }
-        gatt_client_emit(
+        aci_gatt_notification_event_rp0* ev = (aci_gatt_notification_event_rp0*)blue_evt->data;
+        gatt_client_prepare(
+            &emit,
             FuriHalBtCentralEventNotification,
             ev->Attribute_Handle,
             ev->Attribute_Value,
             ev->Attribute_Value_Length);
-        return BleEventAckFlowEnable;
+        break;
     }
 
     default:
-        return BleEventNotAck;
+        break;
     }
+    gatt_client_unlock();
+
+    gatt_client_deliver(&emit);
+    return BleEventAckFlowEnable;
 }

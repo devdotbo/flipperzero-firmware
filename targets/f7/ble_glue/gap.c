@@ -13,6 +13,9 @@
 
 #define FAST_ADV_TIMEOUT    30000
 #define INITIAL_ADV_TIMEOUT 60000
+// No peripheral link. Outside the HCI handle range (0x0000..0x0EFF), so no
+// disconnection-complete (for example of a central link) can match it.
+#define GAP_HANDLE_NONE     0xFFFF
 
 #define GAP_INTERVAL_TO_MS(x) (uint16_t)((x) * 1.25)
 
@@ -130,12 +133,15 @@ BleEventFlowStatus ble_event_app_notification(void* pckt) {
     case HCI_DISCONNECTION_COMPLETE_EVT_CODE: {
         hci_disconnection_complete_event_rp0* disconnection_complete_event =
             (hci_disconnection_complete_event_rp0*)event_pckt->data;
-        if(disconnection_complete_event->Connection_Handle == gap->service.connection_handle) {
-            gap->service.connection_handle = 0;
-            gap->state = GapStateIdle;
-            FURI_LOG_I(
-                TAG, "Disconnect from client. Reason: %02X", disconnection_complete_event->Reason);
+        // Only the peripheral's own link: a foreign (central) handle must not
+        // touch security state, advertising or the peripheral's event.
+        if(disconnection_complete_event->Connection_Handle != gap->service.connection_handle) {
+            break;
         }
+        gap->service.connection_handle = GAP_HANDLE_NONE;
+        gap->state = GapStateIdle;
+        FURI_LOG_I(
+            TAG, "Disconnect from client. Reason: %02X", disconnection_complete_event->Reason);
         gap->is_secure = false;
         gap->negotiation_round = 0;
         // Enterprise sleep
@@ -181,6 +187,11 @@ BleEventFlowStatus ble_event_app_notification(void* pckt) {
         case HCI_LE_CONNECTION_COMPLETE_SUBEVT_CODE: {
             hci_le_connection_complete_event_rp0* event =
                 (hci_le_connection_complete_event_rp0*)meta_evt->data;
+            // Only a successful link in the peripheral role (0x01) belongs to us;
+            // failed attempts and central-role links are owned by the central HAL.
+            if(event->Status != 0 || event->Role != 0x01) {
+                break;
+            }
             gap->connection_params.conn_interval = event->Conn_Interval;
             gap->connection_params.slave_latency = event->Conn_Latency;
             gap->connection_params.supervisor_timeout = event->Supervision_Timeout;
@@ -552,7 +563,7 @@ bool gap_init(
     // Initialization of the GAP state
     gap->state_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     gap->state = GapStateIdle;
-    gap->service.connection_handle = 0xFFFF;
+    gap->service.connection_handle = GAP_HANDLE_NONE;
     gap->enable_adv = true;
 
     // Command queue allocation

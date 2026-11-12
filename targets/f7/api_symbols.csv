@@ -1,5 +1,5 @@
 entry,status,name,type,params
-Version,+,88.3,,
+Version,+,88.4,,
 Header,+,applications/drivers/subghz/cc1101_ext/cc1101_ext_interconnect.h,,
 Header,+,applications/services/bt/bt_service/bt.h,,
 Header,+,applications/services/bt/bt_service/bt_keys_storage.h,,
@@ -1319,6 +1319,7 @@ Function,+,furi_hal_bt_central_deinit,void,
 Function,+,furi_hal_bt_central_disconnect,void,FuriHalBtCentralConnection*
 Function,+,furi_hal_bt_central_find_char,uint16_t,"FuriHalBtCentralConnection*, const uint8_t[( 16 )]"
 Function,+,furi_hal_bt_central_gatt_discover,_Bool,FuriHalBtCentralConnection*
+Function,+,furi_hal_bt_central_gatt_discover_char,_Bool,"FuriHalBtCentralConnection*, const uint8_t[( 16 )]"
 Function,+,furi_hal_bt_central_gatt_subscribe,_Bool,"FuriHalBtCentralConnection*, uint16_t"
 Function,+,furi_hal_bt_central_gatt_write_nr,_Bool,"FuriHalBtCentralConnection*, uint16_t, const uint8_t*, size_t"
 Function,+,furi_hal_bt_central_init,void,
@@ -2001,14 +2002,16 @@ Function,-,gap_init,_Bool,"GapConfig*, const GapRootSecurityKeys*, GapEventCallb
 Function,-,gap_start_advertising,void,
 Function,-,gap_stop_advertising,void,
 Function,-,gap_thread_stop,void,
-Function,-,gatt_client_attach,void,"uint16_t, FuriHalBtCentralEventCallback, void*"
+Function,-,gatt_client_attach,void,"uint16_t, uint32_t"
 Function,-,gatt_client_deinit,void,
 Function,-,gatt_client_discover,_Bool,
+Function,-,gatt_client_discover_char,_Bool,const uint8_t[16]
 Function,-,gatt_client_find_char,uint16_t,const uint8_t[16]
 Function,-,gatt_client_handle_event,BleEventAckStatus,void*
 Function,-,gatt_client_init,void,
 Function,-,gatt_client_reset,void,
 Function,-,gatt_client_subscribe,_Bool,uint16_t
+Function,-,gatt_client_tick,void,
 Function,-,gatt_client_write_nr,_Bool,"uint16_t, const uint8_t*, size_t"
 Function,-,getc,int,FILE*
 Function,-,getc_unlocked,int,FILE*

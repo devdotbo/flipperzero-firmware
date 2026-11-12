@@ -14,6 +14,11 @@ LIST_DEF(GapSvcEventHandlerList, GapSvcEventHandler, M_POD_OPLIST);
 
 static GapSvcEventHandlerList_t handlers;
 static bool initialized = false;
+/* Serialises list traversal on the BLE event thread against register/unregister,
+ * so that a handler that has been unregistered is never called afterwards and its
+ * list node is never read after it was freed. Held only for list operations and
+ * the handler loop; ble_event_app_notification() runs without it. */
+static FuriMutex* handlers_mutex = NULL;
 
 BleEventFlowStatus ble_event_dispatcher_process_event(void* payload) {
     furi_check(initialized);
@@ -21,6 +26,7 @@ BleEventFlowStatus ble_event_dispatcher_process_event(void* payload) {
     GapSvcEventHandlerList_it_t it;
     BleEventAckStatus ack_status = BleEventNotAck;
 
+    furi_check(furi_mutex_acquire(handlers_mutex, FuriWaitForever) == FuriStatusOk);
     for(GapSvcEventHandlerList_it(it, handlers); !GapSvcEventHandlerList_end_p(it);
         GapSvcEventHandlerList_next(it)) {
         const GapSvcEventHandler* item = GapSvcEventHandlerList_cref(it);
@@ -32,7 +38,7 @@ BleEventFlowStatus ble_event_dispatcher_process_event(void* payload) {
             break;
         }
     }
-
+    furi_check(furi_mutex_release(handlers_mutex) == FuriStatusOk);
 
     /* Now, decide on a flow control action based on results of all handlers */
     switch(ack_status) {
@@ -51,15 +57,18 @@ BleEventFlowStatus ble_event_dispatcher_process_event(void* payload) {
 void ble_event_dispatcher_init(void) {
     if(!initialized) {
         GapSvcEventHandlerList_init(handlers);
+        handlers_mutex = furi_mutex_alloc(FuriMutexTypeNormal);
         initialized = true;
     }
 }
 
 void ble_event_dispatcher_reset(void) {
     furi_check(initialized);
+    furi_check(furi_mutex_acquire(handlers_mutex, FuriWaitForever) == FuriStatusOk);
     furi_check(GapSvcEventHandlerList_size(handlers) == 0);
 
     GapSvcEventHandlerList_clear(handlers);
+    furi_check(furi_mutex_release(handlers_mutex) == FuriStatusOk);
 }
 
 GapSvcEventHandler*
@@ -68,18 +77,27 @@ GapSvcEventHandler*
     furi_check(context);
     furi_check(initialized);
 
+    furi_check(furi_mutex_acquire(handlers_mutex, FuriWaitForever) == FuriStatusOk);
     GapSvcEventHandler* item = GapSvcEventHandlerList_push_raw(handlers);
     item->context = context;
     item->callback = handler;
+    furi_check(furi_mutex_release(handlers_mutex) == FuriStatusOk);
 
     return item;
 }
 
 void ble_event_dispatcher_unregister_svc_handler(GapSvcEventHandler* handler) {
     furi_check(handler);
+    furi_check(initialized);
+    /* Called from inside a handler on the BLE event thread this would deadlock. */
+    furi_check(
+        furi_mutex_get_owner(handlers_mutex) != furi_thread_get_current_id(),
+        "BLE handler unregistered from the BLE event thread");
 
     bool found = false;
     GapSvcEventHandlerList_it_t it;
+
+    furi_check(furi_mutex_acquire(handlers_mutex, FuriWaitForever) == FuriStatusOk);
 
     for(GapSvcEventHandlerList_it(it, handlers); !GapSvcEventHandlerList_end_p(it);
         GapSvcEventHandlerList_next(it)) {
@@ -91,6 +109,7 @@ void ble_event_dispatcher_unregister_svc_handler(GapSvcEventHandler* handler) {
             break;
         }
     }
+    furi_check(furi_mutex_release(handlers_mutex) == FuriStatusOk);
 
     furi_check(found);
 }
